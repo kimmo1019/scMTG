@@ -18,13 +18,24 @@ from sklearn.metrics.cluster import normalized_mutual_info_score, adjusted_rand_
 from sklearn.metrics.cluster import homogeneity_score, adjusted_mutual_info_score
 from sklearn.preprocessing import MinMaxScaler,MaxAbsScaler,StandardScaler
 
+
 class Multiome_loader_TI(object):
     def __init__(self, name='multiome',n_components=100,random_seed=1234,label_smooth=True,
                 path = '/home/users/liuqiao/work/multiome'):
         #c:cell, g:gene, l:locus
         self.name = name
-        self.pca_rna_mat = np.load('%s/datasets/combine-v2/process/pca_combine.npy'%path).astype('float32')
+        self.pca_mat = np.load('%s/datasets/combine-v2/process/pca_combine.npy'%path).astype('float32')
+        self.pca_rna_mat = self.pca_mat[:,:50]
+        print(np.min(self.pca_rna_mat),np.max(self.pca_rna_mat))
+        self.pca_rna_mat = MinMaxScaler().fit_transform(self.pca_rna_mat)
+        print(np.min(self.pca_rna_mat),np.max(self.pca_rna_mat))
         self.label_time = np.load('%s/datasets/combine-v2/process/label_time.npy'%path)
+
+        self.tsne_embeds = np.load('%s/datasets/combine-v2/process/tsne_embeds.npy'%path).astype('float32')
+        self.tsne_embeds_d2 = self.tsne_embeds[:3006,:]
+        self.tsne_embeds_d4 = self.tsne_embeds[3006:(3006+2847),:]
+        self.tsne_embeds_d6 = self.tsne_embeds[-5766:,:]
+
         print(self.pca_rna_mat.shape,len(self.label_time))
         self.data_d2 = self.pca_rna_mat[self.label_time=='D2',:]
         self.data_d4 = self.pca_rna_mat[self.label_time=='D4',:]
@@ -35,276 +46,53 @@ class Multiome_loader_TI(object):
         batch_d2_idx =  np.random.choice(len(self.data_d2), size=batch_size, replace=False)
         batch_d4_idx =  np.random.choice(len(self.data_d4), size=batch_size, replace=False)
         batch_d6_idx =  np.random.choice(len(self.data_d6), size=batch_size, replace=False)
-        return self.pca_rna_mat[batch_d2_idx,:], self.pca_rna_mat[batch_d4_idx,:], self.pca_rna_mat[batch_d6_idx,:]
+        return self.data_d2[batch_d2_idx,:], self.data_d4[batch_d4_idx,:], self.data_d6[batch_d6_idx,:]
 
     def load_all(self):
         return self.data_d2, self.data_d4, self.data_d6
 
-def check_symmetric(a, rtol=1e-03, atol=1e-03):
-    return np.allclose(a, a.T, rtol=rtol, atol=atol)
+class ARC_TS_Sampler(object):
+    def __init__(self,name='D2-1',n_components=50,scale=10000,filter_feat=True,filter_cell=False,random_seed=1234,mode=3, \
+        min_rna_c=0,max_rna_c=None,min_atac_c=0,max_atac_c=None,start_t=0,prior_dim = 5):
+        #c:cell, g:gene, l:locus
+        self.name = name
+        self.mode = mode
+        self.min_rna_c = min_rna_c
+        self.max_rna_c = max_rna_c
+        self.min_atac_c = min_atac_c
+        self.max_atac_c = max_atac_c
+        self.start_t = start_t
+        self.prior_dim = prior_dim
+        #previous kmeans
+        if os.path.exists('/home/users/liuqiao/work/multiome/datasets/pca_feats_v2.npz'):
+            data = np.load('/home/users/liuqiao/work/multiome/datasets/pca_feats_v2.npz')
+            nb_cells = [5400, 3408, 6897]
+            self.pca_rna_mat,self.pca_atac_mat = data['arr_0'],data['arr_1']
+            #self.pca_combine = np.hstack((self.pca_rna_mat, self.pca_atac_mat))
+            self.pca_combine = self.pca_rna_mat
+            self.pca_d2 = self.pca_combine[:nb_cells[0],:]
+            self.pca_d4 = self.pca_combine[nb_cells[0]:(nb_cells[0]+nb_cells[1]),:]
+            self.pca_d6 = self.pca_combine[-nb_cells[2]:,:]
+            print(self.pca_d2.shape, self.pca_d4.shape, self.pca_d6.shape)
+            self.embeds = MinMaxScaler().fit_transform(self.pca_combine.copy()).astype('float32')
+            if start_t==0:
+                self.prior = self.embeds[:nb_cells[0],:prior_dim]
+                self.data = self.pca_d4
+            elif start_t==1:
+                self.prior = self.embeds[nb_cells[0]:(nb_cells[0]+nb_cells[1]),:prior_dim]
+                self.data = self.pca_d6
+            else:
+                print('Wrong starting time point %d'%self.start_t)
+                sys.exit()
 
-def calculate_binary_adj_matrix(coor, rad_cutoff=None, k_cutoff=None, model='Radius', return_indice=False):
-    import sklearn.neighbors
-    assert(model in ['Radius', 'KNN'])
-    if model == 'Radius':
-        nbrs = sklearn.neighbors.NearestNeighbors(radius=rad_cutoff).fit(coor)
-        distances, indices = nbrs.radius_neighbors(coor, return_distance=True)
-    
-    if model == 'KNN':
-        nbrs = sklearn.neighbors.NearestNeighbors(n_neighbors=k_cutoff+1).fit(coor)
-        distances, indices = nbrs.kneighbors(coor)
-    A = np.empty((coor.shape[0], coor.shape[0]))
-    for i in range(indices.shape[0]):
-        for j in indices[i]:
-            A[i][j] = 1
-            A[j][i] = 1
-    if return_indice:
-        return A.astype(np.float32), indices
-    else:
-        return A.astype(np.float32)
-
-
-def get_ground_truth_adj_matrix(coor, labels, n_neighbors=6, return_indice=False):
-    import sklearn.neighbors
-    uniq_labels = np.unique(labels)
-    adj_indices = np.empty((coor.shape[0],n_neighbors)).astype(np.int16)
-    A =  np.empty((coor.shape[0], coor.shape[0]))
-    for each in uniq_labels:
-        sample_idx = [i for i,item in enumerate(labels) if item==each]
-        dic = dict(zip(np.arange(len(sample_idx)), sample_idx))
-        coor_sub = coor[sample_idx,:]
-        nbrs = sklearn.neighbors.NearestNeighbors(n_neighbors=n_neighbors).fit(coor_sub)
-        distances, indices = nbrs.kneighbors(coor_sub)
-        adj_indices[sample_idx,:] = np.vectorize(dic.get)(indices)
-    for i in range(adj_indices.shape[0]):
-        for j in adj_indices[i]:
-            A[i][j] = 1
-            A[j][i] = 1
-    if return_indice:
-        return A.astype(np.float32), adj_indices
-    else:
-        return A.astype(np.float32)
-
-class Spatial_DLPFC_sampler(object):
-    def __init__(self, slice_id='151673'):
-        adata = sc.read_visium(path='/home/users/liuqiao/work/spatialRT/data/DLPFC/%s'%slice_id, count_file='%s_filtered_feature_bc_matrix.h5'%slice_id)
-        adata.var_names_make_unique()
-        sc.pp.filter_genes(adata, min_cells=3)
-        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=5000)
-        sc.pp.normalize_per_cell(adata)
-        sc.pp.log1p(adata)
-        adata = adata[:, adata.var.highly_variable]
-        print('highly varible genes', adata.shape)
-        sc.tl.pca(adata, n_comps=50, svd_solver='arpack')
-        #load annotation label
-        annot_df = pd.read_csv('/home/users/liuqiao/work/spatialRT/data/DLPFC/DLPFC_annotations/%s_truth.txt'%slice_id, sep='\t', header=None, index_col=0)
-        #annot_df.fillna('NA', inplace=True)
-        annot_df.columns = ['annotation']
-        adata.obs['annotation'] = annot_df.loc[adata.obs_names, 'annotation']
-        #filter NA cells/spots
-        select_idx = pd.notnull(adata.obs['annotation'])    
-        adata = adata[select_idx,:]
-        print(adata.shape, len(adata.obs['annotation']))
-
-        x_pixel = adata.obsm['spatial'][:,0]
-        y_pixel = adata.obsm['spatial'][:,1]
-        adj, adj_indices = calculate_binary_adj_matrix(coor=adata.obsm['spatial'], k_cutoff=50, model='KNN',return_indice=True)
-        adata.obsm['adj'] = adj
-        adata.obsm['adj_indices'] = adj_indices.astype('int16')
-
-        self.adj_hexigon_neighbor, _ = calculate_binary_adj_matrix(coor=adata.obsm['spatial'], rad_cutoff=200, model='Radius',return_indice=True)
-        #adj, adj_indices = get_ground_truth_adj_matrix(coor=adata.obsm['spatial'], labels=adata.obs['annotation'], n_neighbors=6, return_indice=True)
-        self.embeds = adata.obsm['X_pca']
-        self.adj = adata.obsm['adj']
-        self.adj_indices = adata.obsm['adj_indices'] 
-        self.adj_hexigon_neighbor = self.adj_hexigon_neighbor.astype('float32')
-        #print(np.sum(self.adj_hexigon_neighbor,axis=0)[:10])
-        #print(np.sum(self.adj_hexigon_neighbor[self.adj_hexigon_neighbor>0]))
-        #sys.exit()
-        self.sample_size = adata.shape[0]
-        self.label_annot = adata.obs['annotation']
-        print(np.unique(self.label_annot))
-        scaler = MinMaxScaler()
-        self.coor = scaler.fit_transform(adata.obsm['spatial'].astype('float32'))
-    def get_batch(self, batch_size, use_local = False):
-        if use_local:
-            center_idx = np.random.randint(low = 0, high = self.sample_size, size = 1)[0]
-            indx = self.adj_indices[center_idx][:batch_size]
-        else:
-            indx = np.random.randint(low = 0, high = self.sample_size, size = batch_size)
-        X_batch = self.embeds[indx,:]
-        coor_batch = self.coor[indx,:]
-        adj_batch = self.adj[indx,:][:,indx]
-        adj_hexigon_batch = self.adj_hexigon_neighbor[indx,:][:,indx]
-        X_neighbors_batch = [self.embeds[self.adj_indices[i]] for i in indx]
-        adj_neighbors_batch = [self.adj[self.adj_indices[i],:][:,self.adj_indices[i]] for i in indx]
-        return X_batch, adj_batch, adj_hexigon_batch, X_neighbors_batch, adj_neighbors_batch, coor_batch
+    def get_batch(self, batch_size, sd = 1, weights = None):
+        batch_data_idx =  np.random.choice(len(self.data), size=batch_size, replace=False)
+        batch_prior_idx =  np.random.choice(len(self.prior), size=batch_size, replace=False)
+        return self.data[batch_data_idx,:], self.prior[batch_prior_idx,:]
 
     def load_all(self):
-        return self.embeds, self.adj
-
-
-def Dataset_selector(name):
-    if 'acic' in name:
-        return Semi_acic_sampler
-    elif 'ihdp' in name:
-        return Semi_ihdp_sampler
-    elif 'Hirano' in name:
-        return Sim_Hirano_Imbens_sampler
-    elif 'quadratic' in name:
-        return Sim_quadratic_sampler
-    elif 'linear' in name:
-        return Sim_linear_sampler
-    else:
-        print('Cannot find the data sampler!')
-        sys.exit()
-
-class Sim_linear_sampler(object):
-    def __init__(self, N = 20000, v_dim=10, z0_dim=1, z1_dim=2, z2_dim=2, z3_dim=5, ax = 1, bx = 1):
-        np.random.seed(123)
-        self.sample_size = N
-        self.v_dim = v_dim
-        self.z0_dim = z0_dim
-        self.z1_dim = z1_dim
-        self.z2_dim = z2_dim
-        self.z3_dim = z3_dim
-        self.ax = ax
-        self.bx = bx
-        self.alpha = np.ones(((z0_dim+z1_dim),1))
-        self.beta_1 = np.ones((z0_dim,1)) 
-        self.beta_2 = np.ones((z2_dim,1)) 
-        self.data_v = np.random.normal(0, 1, size=(N, v_dim))
-        self.data_x = self.get_value_x(self.data_v)
-        self.data_y = self.get_value_y(self.data_v, self.data_x)
-        self.data_x = self.data_x.astype('float32')
-        self.data_y = self.data_y.astype('float32')
-        self.data_v = self.data_v.astype('float32')
-        print(self.data_x.shape,self.data_y.shape,self.data_v.shape)
-        print(np.max(self.data_x),np.max(self.data_y), np.max(self.data_v)) #8.036544 242.13437 4.350001
-        print(np.min(self.data_x),np.min(self.data_y), np.min(self.data_v)) #-7.866399 -261.7619 -4.60713
-
-    def train(self, batch_size):
-        indx = np.random.randint(low = 0, high = self.sample_size, size = batch_size)
-        return self.data_x[indx,:], self.data_y[indx,:], self.data_v[indx, :]
-    
-    #get x given v(or z1)
-    def get_value_x(self, v):
-        return np.random.normal(np.dot(v[:,:(self.z0_dim + self.z1_dim)],self.alpha), 1)
-
-    #get y given x and v(or z1)
-    def get_value_y(self, v, x):
-        return np.random.normal(self.bx * x + self.ax* x**2 * (np.dot(v[:,:self.z0_dim], self.beta_1) + \
-        np.dot(v[:,(self.z0_dim+self.z1_dim):(self.z0_dim+self.z1_dim+self.z2_dim)], self.beta_2)) , 1)
-
-    def load_all(self):
-        return self.data_x, self.data_y, self.data_v
-
-class Sim_quadratic_sampler(object):
-    def __init__(self, N = 20000, v_dim=25, z0_dim=3, z1_dim=3, z2_dim=3, z3_dim=3, ax = 1, bx = 1):
-        np.random.seed(123)
-        self.sample_size = N
-        self.v_dim = v_dim
-        self.z0_dim = z0_dim
-        self.z1_dim = z1_dim
-        self.z2_dim = z2_dim
-        self.z3_dim = z3_dim
-        self.ax = ax
-        self.bx = bx
-        self.alpha = np.ones(((z0_dim+z1_dim),1))
-        self.beta_1 = np.ones((z0_dim,1)) 
-        self.beta_2 = np.ones((z2_dim,1)) 
-        self.data_v = np.random.normal(0, 1, size=(N, v_dim))
-        self.data_x = self.get_value_x(self.data_v)
-        self.data_y = self.get_value_y(self.data_v, self.data_x)
-        self.data_x = self.data_x.astype('float32')
-        self.data_y = self.data_y.astype('float32')
-        self.data_v = self.data_v.astype('float32')
-        print(self.data_x.shape,self.data_y.shape,self.data_v.shape)
-        print(np.max(self.data_x),np.max(self.data_y), np.max(self.data_v))#10.559797 156.67995 4.350001
-        print(np.min(self.data_x),np.min(self.data_y), np.min(self.data_v))#-10.261807 -9.006005 -4.60713
-
-    def train(self, batch_size):
-        indx = np.random.randint(low = 0, high = self.sample_size, size = batch_size)
-        return self.data_x[indx,:], self.data_y[indx,:], self.data_v[indx, :]
-    
-    #get x given v(or z1)
-    def get_value_x(self, v):
-        return np.random.normal(np.dot(v[:,:(self.z0_dim + self.z1_dim)],self.alpha), 0.1)
-
-    #get y given x and v(or z1)
-    def get_value_y(self, v, x):
-        return np.random.normal(self.bx * x**2 + self.ax* x * (np.dot(v[:,:self.z0_dim], self.beta_1) + \
-        np.dot(v[:,(self.z0_dim+self.z1_dim):(self.z0_dim+self.z1_dim+self.z2_dim)], self.beta_2)) , 0.1)
-
-    def load_all(self):
-        return self.data_x, self.data_y, self.data_v
-
-class Sim_Hirano_Imbens_sampler(object):
-    def __init__(self, N = 20000, v_dim=15, z0_dim=1, z1_dim=1, z2_dim=1):
-        self.data = np.loadtxt('../baselines/Imbens_sim_data.txt',usecols=range(0,17),delimiter='\t')
-        self.sample_size = N
-        self.v_dim = v_dim
-        self.data_v = self.data[:, 0:v_dim].astype('float32')
-        self.data_x = self.data[:, v_dim].reshape(-1, 1).astype('float32')
-        self.data_y = (self.data[:, v_dim+1]).reshape(-1, 1).astype('float32')
-        print(self.data_x.shape,self.data_y.shape,self.data_v.shape)
-
-    def train(self, batch_size):
-        indx = np.random.randint(low = 0, high = self.sample_size, size = batch_size)
-        return self.data_x[indx,:], self.data_y[indx,:], self.data_v[indx, :]
-
-    def load_all(self):
-        return self.data_x, self.data_y, self.data_v
-
-class Semi_acic_sampler(object):
-    def __init__(self, N = 20000, v_dim=117, z0_dim=1, z1_dim=1, z2_dim=1,
-                path='../data/ACIC_2018', ufid='5d4cabab88b247d1b48cd38b46555b2c'):
-        self.df_covariants = pd.read_csv('%s/x.csv'%path, index_col='sample_id',header=0, sep=',')
-        self.df_sim = pd.read_csv('%s/scaling/factuals/%s.csv'%(path, ufid),index_col='sample_id',header=0, sep=',')
-        dataset = self.df_covariants.join(self.df_sim, how='inner')
-        self.data_x = dataset['z'].values.reshape(-1,1)
-        self.data_y = dataset['y'].values.reshape(-1,1)
-        self.data_v = dataset.values[:,:-2]
-        self.data_v = self.normalize(self.data_v)
-
-        self.sample_size = len(self.data_x)
-        self.v_dim = v_dim
-        self.data_v = self.data_v.astype('float32')
-        self.data_x = self.data_x.astype('float32')
-        self.data_y = self.data_y.astype('float32')
-        print(self.data_x.shape,self.data_y.shape,self.data_v.shape)
-
-    def normalize(self, data):
-        normal_scalar = StandardScaler()
-        data = normal_scalar.fit_transform(data)
-        return data
-
-    def train(self, batch_size):
-        indx = np.random.randint(low = 0, high = self.sample_size, size = batch_size)
-        return self.data_x[indx,:], self.data_y[indx,:], self.data_v[indx, :]
-
-    def load_all(self):
-        return self.data_x, self.data_y, self.data_v
-
-class Semi_ihdp_sampler(object):
-    def __init__(self, N = 20000, v_dim=25, path='../data/IHDP_100', ufid='ihdp_npci_1'):
-        self.data_all = np.loadtxt('%s/%s.csv'%(path, ufid), delimiter=',')
-        self.data_x = self.data_all[:,0].reshape(-1,1)
-        self.data_v = self.data_all[:,5:]
-        self.data_y = self.data_all[:,1].reshape(-1,1)
-        self.sample_size = len(self.data_x)
-        self.v_dim = v_dim
-        self.data_v = self.data_v.astype('float32')
-        self.data_x = self.data_x.astype('float32')
-        self.data_y = self.data_y.astype('float32')
-        print(self.data_x.shape,self.data_y.shape,self.data_v.shape)
-
-    def train(self, batch_size):
-        indx = np.random.randint(low = 0, high = self.sample_size, size = batch_size)
-        return self.data_x[indx,:], self.data_y[indx,:], self.data_v[indx, :]
-
-    def load_all(self):
-        return self.data_x, self.data_y, self.data_v
+        batch_prior_idx =  np.random.choice(len(self.prior), size=len(self.data), replace=True)
+        return self.data, self.prior[batch_prior_idx,:]
 
 
 class Gaussian_sampler(object):
@@ -433,4 +221,50 @@ class DataPool(object):
             return data
 
 if __name__=="__main__":
-    a = Multiome_loader_TI()
+    from umap import UMAP
+    import matplotlib
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    sns.set_style("whitegrid", {'axes.grid' : False})
+    sns.set_style("ticks", {"xtick.major.size": 12, "ytick.major.size": 12})
+    matplotlib.rc('xtick', labelsize=12) 
+    matplotlib.rc('ytick', labelsize=12) 
+    matplotlib.rcParams.update({'font.size': 12})
+
+    legend_params_ = {'loc': 'center left',
+                    'bbox_to_anchor':(1.0, 0.45),
+                    'fontsize': 20,
+                    'ncol': 1,
+                    'frameon': False,
+                    'markerscale': 1.5
+                    }
+    s = ARC_TS_Sampler()
+    data, label_one_hot = s.load_all()
+    label= np.argmax(label_one_hot,axis = 1)
+    data_embeds = UMAP(n_neighbors=15, min_dist=0.1, metric='correlation',random_state=42).fit_transform(data)
+    data_gen = np.load('/home/users/liuqiao/work/scMTG/src/results/20220921_223552/data_pre_99500.npy')
+    data_gen_embeds = UMAP(n_neighbors=15, min_dist=0.1, metric='correlation',random_state=42).fit_transform(data_gen)
+
+    data_embeds_combine = UMAP(n_neighbors=15, min_dist=0.1, metric='correlation',random_state=42).fit_transform(np.concatenate([data, data_gen],axis=0))
+    np.savez('umap_embeds_v3', data_embeds, data_gen_embeds,data_embeds_combine)
+    #label_combine = np.concatenate([label, label+3])
+
+    # classes = np.unique(label)
+    # colors = sns.husl_palette(len(classes), s=.8)
+    # plt.figure(figsize=(8,8))
+    # for i, c in enumerate(classes):
+    #     plt.scatter(data_gen_embeds[label==c, 0], data_gen_embeds[label==c, 1], s=.5, color=colors[i], label=c)
+    # plt.legend(**legend_params_)
+    # plt.savefig('data_gen_embeds.png')
+    #plt.show()
+
+    # def plot_combine(cluster_id):
+    #     classes = np.unique(label_combine)
+    #     colors = sns.husl_palette(len(classes), s=.8)
+    #     plt.figure(figsize=(8,8))
+    #     c, i=cluster_id, cluster_id
+    #     plt.scatter(data_embeds_combine[label_combine==c, 0], data_embeds_combine[label_combine==c, 1], s=.5, color=colors[i], label=c)
+    #     c, i=cluster_id+3, cluster_id+3
+    #     plt.scatter(data_embeds_combine[label_combine==c, 0], data_embeds_combine[label_combine==c, 1], s=.5, color=colors[i], label=c)
+    #     plt.legend(**legend_params_)
+    #     plt.savefig('together_%d.png'%cluster_id)

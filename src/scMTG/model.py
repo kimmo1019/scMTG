@@ -147,7 +147,8 @@ class Encoder(tf.keras.Model):
         with tf.name_scope("h_layer_ouput"):
             output = fc_layer(x)
             logits = output[:, self.feat_dim:]
-            y = tf.nn.softmax(logits)
+            #y = tf.nn.softmax(logits)
+            y = logits
         return output, y
 
 class Encoder_v2(tf.keras.Model):

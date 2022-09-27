@@ -9,5 +9,6 @@ if __name__=="__main__":
     config = args.config
     with open(config, 'r') as f:
         params = yaml.load(f)
-    model = scMTG(params)
+    #model = scMTG(params)
+    model = scDEC(params)
     model.train()
