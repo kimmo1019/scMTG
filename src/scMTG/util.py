@@ -5,6 +5,7 @@ import scipy.io
 import copy
 from scipy import pi
 import sys
+import math
 import pandas as pd
 from os.path import join
 import gzip
@@ -17,7 +18,82 @@ from sklearn.cluster import KMeans
 from sklearn.metrics.cluster import normalized_mutual_info_score, adjusted_rand_score
 from sklearn.metrics.cluster import homogeneity_score, adjusted_mutual_info_score
 from sklearn.preprocessing import MinMaxScaler,MaxAbsScaler,StandardScaler
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+sns.set_style("whitegrid", {'axes.grid' : False})
+sns.set_style("ticks", {"xtick.major.size": 12, "ytick.major.size": 12})
+matplotlib.rc('xtick', labelsize=12) 
+matplotlib.rc('ytick', labelsize=12) 
+matplotlib.rcParams.update({'font.size': 12})
 
+def Dataset_selector(name):
+    if name == 'Semi_acic':
+        return Semi_acic_sampler
+    elif name=='Semi_ihdp':
+        return Semi_ihdp_sampler
+    elif name=='Sim_Hirano_Imbens':
+        return Sim_Hirano_Imbens_sampler
+    elif name=='Sim_Sun':
+        return Sim_Sun_sampler
+    elif name=='Sim_Colangelo':
+        return Sim_Colangelo_sampler
+    elif name=='Semi_Twins':
+        return Semi_Twins_sampler
+    else:
+        print('Cannot find the example data sampler: %s!'%name)
+        sys.exit()
+
+class Base_sampler(object):
+    """Base data sampler.
+
+    Parameters
+    ----------
+    x
+        List or Numpy.ndarray bject denoting the treatment with length N or shape (N, 1) or (N, ). 
+    y
+        List or Numpy.ndarray bject denoting the outcome with length N or shape (N, 1) or (N, ). 
+    batch_size
+        Int object denoting the batch size for mini-batch training. Default: ``32``.
+
+    Examples
+    --------
+    >>> from CausalEGM import Base_sampler
+    >>> import numpy as np
+    >>> x = np.random.normal(size=(2000,))
+    >>> y = np.random.normal(size=(2000,))
+    >>> v = np.random.normal(size=(2000,100))
+    >>> ds = Base_sampler(x=x,y=y,v=v)
+    >>> batch = ds.next_batch() # get a batch of data
+    >>> data = ds.load_all() # get all data as a triplet
+    """
+    def __init__(self, x, y, batch_size=32, normalize=False, random_seed=123):
+        assert x.shape[0]==y.shape[0]
+        np.random.seed(random_seed)
+        self.batch_size = batch_size
+        self.sample_size = x.shape[0]
+        self.full_index = np.arange(self.sample_size)
+        np.random.shuffle(self.full_index)
+        self.idx_gen = self.create_idx_generator(sample_size=self.sample_size)
+        self.data_x = np.array(x, dtype='float32')
+        self.data_y = np.array(y, dtype='float32')
+        
+    def create_idx_generator(self, sample_size, random_seed=123):
+        while True:
+            for step in range(math.ceil(sample_size/self.batch_size)):
+                if (step+1)*self.batch_size <= sample_size:
+                    yield self.full_index[step*self.batch_size:(step+1)*self.batch_size]
+                else:
+                    yield np.hstack([self.full_index[step*self.batch_size:],
+                                    self.full_index[:((step+1)*self.batch_size-sample_size)]])
+                    np.random.shuffle(self.full_index)
+
+    def next_batch(self):
+        indx = next(self.idx_gen)
+        return self.data_x[indx,:], self.data_y[indx,:]
+    
+    def load_all(self):
+        return self.data_x, self.data_y
 
 class Multiome_loader_TI(object):
     def __init__(self, name='multiome',n_components=100,random_seed=1234,label_smooth=True,
@@ -198,6 +274,100 @@ def softmax(x):
     x = np.exp(x) / np.sum(np.exp(x), axis = 1, keepdims = True)
     return x
 
+def plot_embedding(X, labels, classes=None, method='tSNE', cmap='tab20', figsize=(8, 8), markersize=15, dpi=300,marker=None,
+                   return_emb=False, save=False, save_emb=False, show_legend=True, show_axis_label=True, **legend_params):
+    if marker is not None:
+        X = np.concatenate([X, marker], axis=0)
+    N = len(labels)
+    if X.shape[1] != 2:
+        if method == 'tSNE':
+            from sklearn.manifold import TSNE
+            X = TSNE(n_components=2, random_state=124).fit_transform(X)
+        if method == 'PCA':
+            from sklearn.decomposition import PCA
+            X = PCA(n_components=2, random_state=124).fit_transform(X)
+        if method == 'UMAP':
+            from umap import UMAP
+            X = UMAP(n_neighbors=15, min_dist=0.1, metric='correlation',random_state=42).fit_transform(X)
+    labels = np.array(labels)
+    plt.figure(figsize=figsize)
+    if classes is None:
+        classes = np.unique(labels)
+    #tab10, tab20, husl, hls
+    if cmap is not None:
+        cmap = cmap
+    elif len(classes) <= 10:
+        cmap = 'tab10'
+    elif len(classes) <= 20:
+        cmap = 'tab20'
+    else:
+        cmap = 'husl'
+    colors = sns.husl_palette(len(classes), s=.8)
+    #markersize = 80
+    for i, c in enumerate(classes):
+        x_center, y_center = np.mean(X[:N][labels==c, 0]), np.mean(X[:N][labels==c, 1])
+        plt.scatter(X[:N][labels==c, 0], X[:N][labels==c, 1], s=markersize, color=colors[i], label=c)
+        plt.text(x_center, y_center, str(i), dict(size=20))
+        
+    if marker is not None:
+        plt.scatter(X[N:, 0], X[N:, 1], s=10*markersize, color='black', marker='*')
+    
+    legend_params_ = {'loc': 'center left',
+                     'bbox_to_anchor':(1.0, 0.45),
+                     'fontsize': 20,
+                     'ncol': 1,
+                     'frameon': False,
+                     'markerscale': 1.5
+                    }
+    legend_params_.update(**legend_params)
+    if show_legend:
+        plt.legend(**legend_params_)
+    sns.despine(offset=10, trim=True)
+    if show_axis_label:
+        plt.xlabel(method+' dim 1', fontsize=12)
+        plt.ylabel(method+' dim 2', fontsize=12)
+    if save:
+        plt.savefig(save, format='png', bbox_inches='tight',dpi=dpi)
+    plt.show()
+
+
+def get_cluster_label(data, n_clusters=10,method='leiden'):
+
+    def getNClusters(adata,n_cluster,range_min=0,range_max=3,max_steps=20):
+        this_step = 0
+        this_min = float(range_min)
+        this_max = float(range_max)
+        while this_step < max_steps:
+            #print('step ' + str(this_step))
+            this_resolution = this_min + ((this_max-this_min)/2)
+            if method == 'leiden':
+                sc.tl.leiden(adata,resolution=this_resolution)
+            elif method == 'louvain':
+                sc.tl.louvain(adata,resolution=this_resolution)
+            else:
+                print('Wrong method for clustering')
+                sys.exit()
+            this_clusters = adata.obs[method].nunique()
+
+            #print('got ' + str(this_clusters) + ' at resolution ' + str(this_resolution))
+
+            if this_clusters > n_cluster:
+                this_max = this_resolution
+            elif this_clusters < n_cluster:
+                this_min = this_resolution
+            else:
+                return(this_resolution, adata)
+            this_step += 1
+
+        #print('Cannot find the number of clusters')
+        #print('Clustering solution from last iteration is used:' + str(this_clusters) + ' at resolution ' + str(this_resolution))
+    adata = sc.AnnData(data)
+    np.random.seed(123)
+    sc.pp.neighbors(adata, n_neighbors=15,use_rep='X')
+    getNClusters(adata,n_cluster=n_clusters)
+    return adata.obs[method]
+
+
 #get a batch of data from previous 50 batches, add stochastic
 class DataPool(object):
     def __init__(self, maxsize=50):
@@ -238,6 +408,66 @@ if __name__=="__main__":
                     'frameon': False,
                     'markerscale': 1.5
                     }
+    def plot_embedding(X, labels, classes=None, method='tSNE', cmap='tab20', figsize=(8, 8), markersize=15, dpi=300,marker=None,
+                    return_emb=False, save=False, save_emb=False, show_legend=True, show_axis_label=True, **legend_params):
+        if marker is not None:
+            X = np.concatenate([X, marker], axis=0)
+        N = len(labels)
+        if X.shape[1] != 2:
+            if method == 'tSNE':
+                from sklearn.manifold import TSNE
+                X = TSNE(n_components=2, random_state=124).fit_transform(X)
+            if method == 'PCA':
+                from sklearn.decomposition import PCA
+                X = PCA(n_components=2, random_state=124).fit_transform(X)
+            if method == 'UMAP':
+                from umap import UMAP
+                X = UMAP(n_neighbors=15, min_dist=0.1, metric='correlation',random_state=42).fit_transform(X)
+        labels = np.array(labels)
+        plt.figure(figsize=figsize)
+        if classes is None:
+            classes = np.unique(labels)
+        #tab10, tab20, husl, hls
+        if cmap is not None:
+            cmap = cmap
+        elif len(classes) <= 10:
+            cmap = 'tab10'
+        elif len(classes) <= 20:
+            cmap = 'tab20'
+        else:
+            cmap = 'husl'
+        colors = sns.husl_palette(len(classes), s=.8)
+        #markersize = 80
+        for i, c in enumerate(classes):
+            x_center, y_center = np.mean(X[:N][labels==c, 0]), np.mean(X[:N][labels==c, 1])
+            plt.scatter(X[:N][labels==c, 0], X[:N][labels==c, 1], s=markersize, color=colors[i], label=c)
+            plt.text(x_center, y_center, str(i), dict(size=20))
+            
+        if marker is not None:
+            plt.scatter(X[N:, 0], X[N:, 1], s=10*markersize, color='black', marker='*')
+        
+        legend_params_ = {'loc': 'center left',
+                        'bbox_to_anchor':(1.0, 0.45),
+                        'fontsize': 20,
+                        'ncol': 1,
+                        'frameon': False,
+                        'markerscale': 1.5
+                        }
+        legend_params_.update(**legend_params)
+        if show_legend:
+            plt.legend(**legend_params_)
+        sns.despine(offset=10, trim=True)
+        if show_axis_label:
+            plt.xlabel(method+' dim 1', fontsize=12)
+            plt.ylabel(method+' dim 2', fontsize=12)
+        if save:
+            plt.savefig(save, format='png', bbox_inches='tight',dpi=dpi)
+        plt.show()
+    data =np.load('/home/users/liuqiao/work/NIPS_comp22/train_rna.npz')
+    pca,celltypes,times = data['arr_0'],data['arr_1'],data['arr_2']
+    plot_embedding(pca,celltypes,save='nips_celltype_umap.png',method='UMAP')
+    plot_embedding(pca,times,save='nips_time.png',method='UMAP')
+    sys.exit()
     s = ARC_TS_Sampler()
     data, label_one_hot = s.load_all()
     label= np.argmax(label_one_hot,axis = 1)

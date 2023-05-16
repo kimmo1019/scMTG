@@ -20,183 +20,155 @@ class scMTG(object):
     def __init__(self, params):
         super(scMTG, self).__init__()
         self.params = params
-        self.g24_net = Generator(input_dim=2+params['z_dim'],z_dim = params['z_dim'], 
-            output_dim = params['pca_dim'],model_name='g24_net',nb_layers=8, nb_units=256, concat_every_fcl=False)
-        self.d4_net = Discriminator(input_dim=params['pca_dim'],model_name='d4_net',nb_layers=3,nb_units=128)
+        self.timestamp = timestamp
+        if random_seed is not None:
+            tf.keras.utils.set_random_seed(random_seed)
+        self.encoder = BaseFullyConnectedNet(input_dim=params['e_dim'],output_dim = params['z_dim'], 
+                                        model_name='e_net', nb_units=params['e_units'])
+        self.decoder = BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = params['e_dim'],
+                                        model_name='d_net', nb_units=params['d_units'])
+        self.generators = [BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = params['z_dim'],
+                                        model_name='g_net_%d'%i, nb_units=params['g_units']) 
+                                        for i in range(params['nb_time']-1)]                     
+        self.discriminators = [BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = 1,
+                                        model_name='d_net_%d'%i, nb_units=params['d_units']) 
+                                        for i in range(params['nb_time']-1)] 
+        self.optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
 
-        self.g46_net = Generator(input_dim=2+params['z_dim'],z_dim = params['z_dim'], 
-            output_dim = params['pca_dim'],model_name='g46_net',nb_layers=8, nb_units=256, concat_every_fcl=False)
-        self.d6_net = Discriminator(input_dim=params['pca_dim'],model_name='d6_net',nb_layers=3,nb_units=128)
-
-        self.g24_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
-        self.d4_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
-
-        self.g46_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
-        self.d6_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
-
-        self.z_sampler = Gaussian_sampler(N=20000, mean=np.zeros(params['z_dim']), sd=1)
-        self.x_sampler = Multiome_loader_TI()
-
-        self.initilize_nets()
-        now = datetime.datetime.now(dateutil.tz.tzlocal())
-        self.timestamp = now.strftime('%Y%m%d_%H%M%S')
+        if self.timestamp is None:
+            now = datetime.datetime.now(dateutil.tz.tzlocal())
+            self.timestamp = now.strftime('%Y%m%d_%H%M%S')
         
-        self.checkpoint_path = "checkpoints/%s" % self.timestamp
-        if not os.path.exists(self.checkpoint_path):
+        self.checkpoint_path = "{}/checkpoints/{}/{}".format(
+            params['output_dir'], params['dataset'], self.timestamp)
+
+        if self.params['save_model'] and not os.path.exists(self.checkpoint_path):
             os.makedirs(self.checkpoint_path)
         
-        self.save_dir = "results/%s" % self.timestamp
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
-        json.dump(params, open( "%s/params.json"%self.save_dir, 'w' ))
-        self.f_log = open('%s/log.txt'%self.save_dir,'a+')   
-        ckpt = tf.train.Checkpoint(g24_net = self.g24_net,
-                                   d4_net = self.d4_net,
-                                   g46_net = self.g46_net,
-                                   d6_net = self.d6_net,
-                                   g24_optimizer = self.g24_optimizer,
-                                   d4_optimizer = self.d4_optimizer,
-                                   g46_optimizer = self.g46_optimizer,
-                                   d6_optimizer = self.d6_optimizer)
-        self.ckpt_manager = tf.train.CheckpointManager(ckpt, self.checkpoint_path, max_to_keep=100)                 
+        self.save_dir = "{}/results/{}/{}".format(
+            params['output_dir'], params['dataset'], self.timestamp)
+
+        if self.params['save_res'] and not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)   
+
+        self.ckpt = tf.train.Checkpoint(encoder = self.encoder,
+                                   decoder = self.decoder,
+                                   de_net = self.de_net,
+                                   generators = self.generators,
+                                   discriminators = self.discriminators,
+                                   optimizer = self.optimizer)
+        self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, self.checkpoint_path, max_to_keep=3)                 
 
         if self.ckpt_manager.latest_checkpoint:
-            ckpt.restore(self.ckpt_manager.latest_checkpoint)
-            print ('Latest checkpoint restored!!')
+            self.ckpt.restore(self.ckpt_manager.latest_checkpoint)
+            print ('Latest checkpoint restored!!') 
+
 
     def get_config(self):
         return {
                 "params": self.params,
         }
 
-    def initilize_nets(self, print_summary = True):
-        self.g24_net(np.zeros((1, 2+self.params['z_dim'])))
-        self.d4_net(np.zeros((1, self.params['pca_dim'])))
-        self.g46_net(np.zeros((1, 2+self.params['z_dim'])))
-        self.d6_net(np.zeros((1, self.params['pca_dim'])))
-        if print_summary:
-            print(self.g24_net.summary())
-            print(self.d4_net.summary())
-            print(self.g46_net.summary())
-            print(self.d6_net.summary())
 
     @tf.function
-    def train_gen24_step(self, data_z, data_x2, data_x4):
-        with tf.GradientTape(persistent=True) as gen24_tape:
-            data_z_combine = tf.concat([data_z, data_x2], axis=-1)
-            data_x4_ = self.g24_net(data_z_combine)
-            data_dx4_ = self.d4_net(data_x4_)
-            g24_loss_adv = -tf.reduce_mean(data_dx4_)
-            g24_displace_loss = tf.reduce_mean((data_x4 - data_x4_)**2)
-            g24_loss = g24_loss_adv + self.params['alpha'] * g24_displace_loss
-        g24_gradients = gen24_tape.gradient(g24_loss, self.g24_net.trainable_variables)
+    def train_ae_step(self, data_series):
+        """train shared AE.
+        """  
+        with tf.GradientTape(persistent=True) as tape:
+            embed_series = [self.encoder(data) for data in data_series]
+            data_series_rec = tf.stack([self.decoder(data) for data in embed_series])
+            rec_loss = tf.reduce_mean((data_series - data_series_rec)**2)
+        # Calculate the gradients
+        gradients = tape.gradient(rec_loss, self.encoder.trainable_variables+self.decoder.trainable_variables)
+        
         # Apply the gradients to the optimizer
-        self.g24_optimizer.apply_gradients(zip(g24_gradients, self.g24_net.trainable_variables))
-        return g24_loss_adv, g24_displace_loss
+        self.optimizer.apply_gradients(zip(gradients, self.encoder.trainable_variables+self.decoder.trainable_variables))
+        return rec_loss
 
     @tf.function
-    def train_gen46_step(self, data_z, data_x4, data_x6):
-        with tf.GradientTape(persistent=True) as gen46_tape:
-            data_z_combine = tf.concat([data_z, data_x4], axis=-1)
-            data_x6_ = self.g46_net(data_z_combine)
-            data_dx6_ = self.d6_net(data_x6_)
-            g46_loss_adv = -tf.reduce_mean(data_dx6_)
-            g46_displace_loss = tf.reduce_mean((data_x6 - data_x6_)**2)
-            g46_loss = g46_loss_adv + self.params['alpha'] * g46_displace_loss
-        g46_gradients = gen46_tape.gradient(g46_loss, self.g46_net.trainable_variables)
+    def train_gen_step(self, data_series):
+        """train generators.
+        """  
+        with tf.GradientTape(persistent=True) as tape:
+            data_previous = [tf.concat([data, tf.random.normal(tf.shape(data),0.,1.),axis=1]) 
+                                for data in data_series[:-1]] #contain T-1 time points
+            data_gen = [self.generators[i](data) for i,data in enumerate(data_previous)]
+            data_true = [data for data in data_series[1:]]
+
+            dz_gen = [self.discriminators[i](data) for i,data in enumerate(data_gen)]
+            #dz_true = [self.discriminators[i](data) for i,data in enumerate(data_true)]
+
+            loss_g = tf.reduce_mean([-tf.reduce_mean(data) for data in dz_gen])
+        # Calculate the gradients
+        gradients = tape.gradient(loss_g, [*(item.trainable_variables) for item in self.generators])
+        
         # Apply the gradients to the optimizer
-        self.g46_optimizer.apply_gradients(zip(g46_gradients, self.g46_net.trainable_variables))
-        return g46_loss_adv, g46_displace_loss
+        self.optimizer.apply_gradients(zip(gradients, [*(item.trainable_variables) for item in self.generators]))
+        return loss_g
 
     @tf.function
-    def train_disc4_step(self, data_z, data_x2, data_x4):
-        epsilon_x = tf.random.uniform([],minval=0., maxval=1.)
-        with tf.GradientTape(persistent=True) as disc4_tape:
-            data_z_combine = tf.concat([data_z, data_x2], axis=-1)
-            data_x4_ = self.g24_net(data_z_combine)
-            data_dx4_ = self.d4_net(data_x4_)
-            data_dx4 = self.d4_net(data_x4)
-            dx4_loss = -tf.reduce_mean(data_dx4) + tf.reduce_mean(data_dx4_)
-            #gradient penalty for x
-            data_x_hat = data_x4*epsilon_x + data_x4_*(1-epsilon_x)
-            data_dx_hat = self.d4_net(data_x_hat)
-            grad_x = tf.gradients(data_dx_hat, data_x_hat)[0] #(bs,x_dim)
-            grad_norm_x = tf.sqrt(tf.reduce_sum(tf.square(grad_x), axis=1))#(bs,)
-            gpx_loss = tf.reduce_mean(tf.square(grad_norm_x - 1.0))
-            
-            d4_loss = dx4_loss + self.params['gamma']*gpx_loss
-        
-        # Calculate the gradients for generators and discriminators
-        d4_gradients = disc4_tape.gradient(d4_loss, self.d4_net.trainable_variables)
-        
-        # Apply the gradients to the optimizer
-        self.d4_optimizer.apply_gradients(zip(d4_gradients, self.d4_net.trainable_variables))
-        return d4_loss
+    def train_disc_step(self, data_series):
+        """train discriminators.
+        """  
 
-    @tf.function
-    def train_disc6_step(self, data_z, data_x4, data_x6):
-        epsilon_x = tf.random.uniform([],minval=0., maxval=1.)
-        with tf.GradientTape(persistent=True) as disc6_tape:
-            data_z_combine = tf.concat([data_z, data_x4], axis=-1)
-            data_x6_ = self.g46_net(data_z_combine)
-            data_dx6_ = self.d6_net(data_x6_)
-            data_dx6 = self.d6_net(data_x6)
-            dx6_loss = -tf.reduce_mean(data_dx6) + tf.reduce_mean(data_dx6_)
-            #gradient penalty for x
-            data_x_hat = data_x6*epsilon_x + data_x6_*(1-epsilon_x)
-            data_dx_hat = self.d6_net(data_x_hat)
-            grad_x = tf.gradients(data_dx_hat, data_x_hat)[0] #(bs,x_dim)
-            grad_norm_x = tf.sqrt(tf.reduce_sum(tf.square(grad_x), axis=1))#(bs,)
-            gpx_loss = tf.reduce_mean(tf.square(grad_norm_x - 1.0))
-            
-            d6_loss = dx6_loss + self.params['gamma']*gpx_loss
-        
-        # Calculate the gradients for generators and discriminators
-        d6_gradients = disc6_tape.gradient(d6_loss, self.d6_net.trainable_variables)
+        with tf.GradientTape(persistent=True) as tape:
+            data_previous = [tf.concat([data, tf.random.normal(tf.shape(data),0.,1.),axis=1]) 
+                                for data in data_series[:-1]] #contain T-1 time points
+            data_gen = [self.generators[i](data) for i,data in enumerate(data_previous)]
+            data_true = [data for data in data_series[1:]]
+
+            dz_gen = [self.discriminators[i](data) for i,data in enumerate(data_gen)]
+            dz_true = [self.discriminators[i](data) for i,data in enumerate(data_true)]
+            loss_d = tf.reduce_mean([tf.reduce_mean(data) for data in dz_gen]) - \
+                        tf.reduce_mean([tf.reduce_mean(data) for data in dz_true]) 
+
+            #gradient penalty for z
+            epsilon_z = tf.random.uniform([],minval=0., maxval=1.)
+            data_hat = [item[0]*epsilon_z+item[1]*(1-epsilon_z) for item in zip(dz_gen,dz_true)]
+            dz_hat = [self.discriminators[i](data) for i,data in enumerate(data_hat)]
+            grad_z = [tf.gradients(item[1], item[0])[0] for item in zip(data_hat,dz_hat)] #(bs,z_dim)
+            grad_norm_z = [tf.sqrt(tf.reduce_sum(tf.square(item), axis=1)) for item in grad_z]
+            gpz_loss = tf.reduce_mean([tf.reduce_mean(tf.square(item - 1.0)) for item in grad_norm_z])
+
+            loss_d_total = loss_d + self.params['alpha']*gpz_loss
+        # Calculate the gradients
+        gradients = tape.gradient(loss_d_total, [*(item.trainable_variables) for item in self.discriminators])
         
         # Apply the gradients to the optimizer
-        self.d6_optimizer.apply_gradients(zip(d6_gradients, self.d6_net.trainable_variables))
-        return d6_loss
+        self.optimizer.apply_gradients(zip(gradients, [*(item.trainable_variables) for item in self.discriminators]))
+        return loss_d, gpz_loss, loss_d_total
 
     def train(self):
-        batches_per_eval = 500
-        batch_size = self.params['bs']
-        for batch_idx in range(self.params['nb_batches']):
+        if self.params['save_res']:
+            f_params = open('{}/params.txt'.format(self.save_dir),'w')
+            f_params.write(str(self.params))
+            f_params.close()
+        if data is None:
+            self.data_sampler = Dataset_selector(self.params['dataset'])(batch_size=batch_size)
+        else:
+            self.data_sampler = Base_sampler(x=data[0],y=data[1],batch_size=batch_size,normalize=normalize)
+
+        #train autoencoders
+        for batch_idx in range(n_iter+1):
+            batch_data_series = self.data_sampler.next_batch()
+            rec_loss = self.train_ae_step(batch_data_series)
             for _ in range(5):
-                batch_z = self.z_sampler.train(batch_size)
-                batch_x2, batch_x4, batch_x6 = self.x_sampler.get_batch(batch_size) 
-                #d4_loss = self.train_disc4_step(batch_z, batch_x2, batch_x4)
-                #d6_loss = self.train_disc6_step(batch_z, batch_x4, batch_x6)
-                d4_loss = self.train_disc4_step(batch_z, np.random.normal(size=(batch_size, 2)).astype('float32'), batch_x4)
-                d6_loss = self.train_disc6_step(batch_z, np.random.normal(size=(batch_size, 2)).astype('float32'), batch_x6)
-            batch_z = self.z_sampler.train(batch_size)
-            batch_x2, batch_x4, batch_x6 = self.x_sampler.get_batch(batch_size) 
-            #g24_loss_adv, g24_displace_loss = self.train_gen24_step(batch_z, batch_x2, batch_x4)
-            #g46_loss_adv, g46_displace_loss = self.train_gen46_step(batch_z, batch_x4, batch_x6)
-            g24_loss_adv, g24_displace_loss = self.train_gen24_step(batch_z, np.random.normal(size=(batch_size, 2)).astype('float32'), batch_x4)
-            g46_loss_adv, g46_displace_loss = self.train_gen46_step(batch_z, np.random.normal(size=(batch_size, 2)).astype('float32'), batch_x6)
-            #update TV_loss
-            #tv_loss = self.train_tv_step(self.x_sampler.embeds, self.x_sampler.adj_hexigon_neighbor)
+                batch_data_series = self.data_sampler.next_batch()
+                loss_d, gpz_loss, loss_d_total = self.train_disc_step(batch_data_series)
+            batch_data_series = self.data_sampler.next_batch()
+            loss_g = self.train_gen_step(batch_data_series)
             if batch_idx % batches_per_eval == 0:
-                log = "Batch_idx [%d] g24_loss_adv [%.4f] g24_displace_loss [%.4f] g46_loss_adv \
-                    [%.4f] g46_displace_loss [%.4f] d4_loss [%.4f] d6_loss [%.4f] " % (batch_idx, g24_loss_adv, g24_displace_loss, 
-                        g46_loss_adv, g46_displace_loss, d4_loss, d6_loss)
-                print(log)
-                self.f_log.write(log+'\n')
-                self.evaluate(batch_idx)
-        self.f_log.close()
+                loss_contents = '''Iteration [%d] : gpz_loss [%.4f], gpz_loss [%.4f], loss_d [%.4f], loss_g [%.4f]''' \
+                %(batch_idx, gpz_loss, gpz_loss, loss_d, loss_g)
+                if verbose:
+                    print(loss_contents)
+                self.evaluate(self.data_sampler.load_all(), batch_idx)
 
-    def evaluate(self,batch_idx, N = 10000):
-        batch_z = self.z_sampler.train(N)
-        data_x2, data_x4, data_x6 = self.x_sampler.load_all()
-        batch_z = self.z_sampler.train(len(data_x2))
-        data_x2 = np.random.normal(size=(len(data_x2), 2))
-        data_x4_ = self.g24_net(np.concatenate([data_x2, batch_z],axis=-1))
-        batch_z = self.z_sampler.train(len(data_x4))
-        data_x4 = np.random.normal(size=(len(data_x4), 2))
-        data_x6_ = self.g24_net(np.concatenate([data_x4, batch_z],axis=-1))
-        np.savez('{}/data_at_{}.npz'.format(self.save_dir, batch_idx+1),data_x4_,data_x6_)
-
+    def evaluate(self, data_series, batch_idx):
+        data_previous = [np.concatenate([data, np.random.normal(data.shape,0.,1.),axis=1]) 
+                            for data in data_series[:-1]] #contain T-1 time points
+        data_gen = np.stack([self.generators[i](data) for i,data in enumerate(data_previous)])
+        np.savez('{}/data_gen_at_{}.npz'.format(self.save_dir, batch_idx),data_gen)
 
 
 class scDEC(object):
