@@ -1,7 +1,7 @@
 import tensorflow as tf
-from .model import Generator, Encoder, Discriminator
+from .model import Generator, Encoder, Discriminator, BaseFullyConnectedNet
 import numpy as np
-from .util import Gaussian_sampler, Multiome_loader_TI, Mixture_sampler,ARC_TS_Sampler
+from .util import Gaussian_sampler, Multiome_loader_TI, Mixture_sampler,ARC_TS_Sampler, Base_sampler
 import dateutil.tz
 import datetime
 import sys
@@ -10,6 +10,9 @@ import os
 import json
 #tf.keras.utils.set_random_seed(123)
 #os.environ['TF_DETERMINISTIC_OPS'] = '1'
+
+gpus = tf.config.experimental.list_physical_devices('GPU')
+tf.config.experimental.set_memory_growth(gpus[0], True)
 
 class scMTG(object):
     """scMTG model for clustering.
@@ -353,7 +356,7 @@ class scDEC(object):
         return dx_loss, dz_loss, d_loss
 
     def train(self): 
-        batches_per_eval = 500
+        batches_per_eval = 2000
         batch_size = self.params['bs']
         for batch_idx in range(self.params['nb_batches']):
             for _ in range(5):
@@ -373,10 +376,291 @@ class scDEC(object):
                 #ckpt_save_path = self.ckpt_manager.save()
                 #print ('Saving checkpoint for epoch {} at {}'.format(batch_idx,ckpt_save_path))
 
-    def evaluate(self,batch_idx):
+    def evaluate(self, batch_idx, nb_per_sample = 1000):
         data_x, label_ts = self.x_sampler.load_all()
         batch_z, _ = self.z_sampler.train(len(data_x))
-        #print(data_x.shape,label_ts.shape,batch_z.shape)
-        #sys.exit()
-        data_gen = self.g_net(np.concatenate([batch_z,label_ts],axis=1))
+        data_gen = self.g_net(np.concatenate([batch_z, label_ts],axis=1))
         np.save('{}/data_pre_{}.npy'.format(self.save_dir, batch_idx),data_gen)
+        prior = self.x_sampler.prior
+        data_gen = []
+        for i in range(len(prior)):
+            batch_z, _ = self.z_sampler.train(nb_per_sample)
+            data_gen.append(self.g_net(np.concatenate([batch_z, np.tile(prior[i,:],(nb_per_sample,1))],axis=1)))
+        np.save('{}/data_pre_{}_all.npy'.format(self.save_dir, batch_idx),np.stack(data_gen))
+
+class scMulReg(object):
+    """single cell multiome autoencoder mapping with regulatory score
+    """
+    def __init__(self, params, timestamp=None, random_seed=None):
+        super(scMulReg, self).__init__()
+        self.params = params
+        self.timestamp = timestamp
+        if random_seed is not None:
+            tf.keras.utils.set_random_seed(random_seed)
+            os.environ['TF_DETERMINISTIC_OPS'] = '1'
+        self.ee_net = BaseFullyConnectedNet(input_dim=params['e_dim'],output_dim = params['z_dim'], 
+                                        model_name='ee_net', nb_units=params['ee_units'])
+        self.ea_net = BaseFullyConnectedNet(input_dim=params['a_dim'],output_dim = params['z_dim'], 
+                                        model_name='ea_net', nb_units=params['ea_units'])
+        self.de_net = BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = params['e_dim'],#+977 
+                                        model_name='de_net', nb_units=params['de_units'])
+        self.da_net = BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = params['a_dim'], 
+                                        model_name='da_net', nb_units=params['da_units'])
+        self.reg_net = BaseFullyConnectedNet(input_dim=955,output_dim = 1, 
+                                        model_name='reg_net', nb_units=params['reg_units'])
+        self.optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
+
+        if self.timestamp is None:
+            now = datetime.datetime.now(dateutil.tz.tzlocal())
+            self.timestamp = now.strftime('%Y%m%d_%H%M%S')
+        
+        self.checkpoint_path = "{}/checkpoints/{}/{}".format(
+            params['output_dir'], params['dataset'], self.timestamp)
+
+        if self.params['save_model'] and not os.path.exists(self.checkpoint_path):
+            os.makedirs(self.checkpoint_path)
+        
+        self.save_dir = "{}/results/{}/{}".format(
+            params['output_dir'], params['dataset'], self.timestamp)
+
+        if self.params['save_res'] and not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)   
+
+        self.ckpt = tf.train.Checkpoint(ee_net = self.ee_net,
+                                   ea_net = self.ea_net,
+                                   de_net = self.de_net,
+                                   da_net = self.da_net,
+                                   reg_net = self.reg_net,
+                                   optimizer = self.optimizer)
+        self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, self.checkpoint_path, max_to_keep=3)                 
+
+        if self.ckpt_manager.latest_checkpoint:
+            self.ckpt.restore(self.ckpt_manager.latest_checkpoint)
+            print ('Latest checkpoint restored!!') 
+        
+    def get_config(self):
+        return {
+                "params": self.params,
+        }
+
+    #@tf.function
+    def train_step(self, data_exp, data_atac, 
+        reg_dic, TF_gene_idx, TG_idx):
+        """train step.
+        """  
+        with tf.GradientTape(persistent=True) as tape:
+            #data_tf_exp = data_exp[:,self.params['e_dim']:]
+            #data_exp = data_exp[:,:self.params['e_dim']]
+            data_z_exp = self.ee_net(data_exp)
+            data_z_atac = self.ea_net(data_atac)
+            align_loss = tf.reduce_mean((data_z_exp - data_z_atac)**2)
+
+            data_z = (data_z_exp+data_z_atac)/2
+            data_exp_rec = self.de_net(data_z)
+            #data_exp_rec = self.de_net(tf.concat([data_z,data_tf_exp],axis=1))
+            data_atac_rec = self.da_net(data_z)
+
+            #(nb_TFs, nb_TGs, bs)
+            #reg_score = self.get_reg_score_v2(reg_dic, data_exp_rec, data_atac_rec, TFs, TGs, all_genes, query_genes)
+            reg_score = self.get_reg_score_v2(reg_dic, data_exp_rec, data_atac_rec, TF_gene_idx, TG_idx)
+            #[ nb_TGs, nb_TFs  bs]
+
+            reg_score = tf.transpose(reg_score,[2,0,1])
+            reg_score = tf.reshape(reg_score,[-1, len(TF_gene_idx)])
+            reg_pre = self.reg_net(reg_score) #(bs*nb_TGs, 1)
+            reg_pre = tf.reshape(reg_pre,[tf.shape(data_exp)[0],len(TG_idx)])
+            #reg_loss = tf.reduce_mean((reg_pre - tf.gather(data_exp_rec, axis=1,indices=gene_idx))**2)
+            reg_loss = tf.reduce_mean((reg_pre - tf.gather(data_exp, axis=1,indices=TG_idx))**2)
+
+            exp_rec_loss = tf.reduce_mean((data_exp - data_exp_rec)**2)
+            atac_rec_loss = tf.reduce_mean((data_atac - data_atac_rec)**2)
+
+            total_loss = exp_rec_loss + atac_rec_loss + self.params['alpha']*align_loss + self.params['beta']*reg_loss
+
+        # Calculate the gradients
+        gradients = tape.gradient(total_loss, self.ee_net.trainable_variables+self.ea_net.trainable_variables+
+                        self.de_net.trainable_variables+self.da_net.trainable_variables+self.reg_net.trainable_variables)
+
+        # Apply the gradients to the optimizer
+        self.optimizer.apply_gradients(zip(gradients, self.ee_net.trainable_variables+self.ea_net.trainable_variables+
+                        self.de_net.trainable_variables+self.da_net.trainable_variables+self.reg_net.trainable_variables))
+        return exp_rec_loss, atac_rec_loss, align_loss, reg_loss, total_loss
+
+    @tf.function
+    def train_ae_step(self, data_exp, data_atac):
+        """train step with out regulatory score.
+        """  
+        with tf.GradientTape(persistent=True) as tape:
+            data_z_exp = self.ee_net(data_exp)
+            data_z_atac = self.ea_net(data_atac)
+            align_loss = tf.reduce_mean((data_z_exp - data_z_atac)**2)
+
+            data_z = (data_z_exp+data_z_atac)/2
+            data_exp_rec = self.de_net(data_z)
+            data_atac_rec = self.da_net(data_z)
+
+            exp_rec_loss = tf.reduce_mean((data_exp - data_exp_rec)**2)
+            atac_rec_loss = tf.reduce_mean((data_atac - data_atac_rec)**2)
+
+            total_loss = exp_rec_loss + atac_rec_loss + self.params['alpha']*align_loss
+            
+        # Calculate the gradients
+        gradients = tape.gradient(total_loss, self.ee_net.trainable_variables+self.ea_net.trainable_variables+
+                        self.de_net.trainable_variables+self.da_net.trainable_variables)
+        
+        # Apply the gradients to the optimizer
+        self.optimizer.apply_gradients(zip(gradients, self.ee_net.trainable_variables+self.ea_net.trainable_variables+
+                        self.de_net.trainable_variables+self.da_net.trainable_variables))
+        return exp_rec_loss, atac_rec_loss, align_loss, total_loss
+
+
+    def train(self, data=None, data_file=None, sep='\t', header=0, normalize=False,
+            batch_size=16, n_iter=50000, batches_per_eval=5000, batches_per_save=500,
+            startoff=0, verbose=1, save_format='txt'):
+        """
+        Train a scMulReg model given the input data.
+        
+        Parameters
+        ----------
+        data
+            List object containing the triplet data [X,Y,V]. Default: ``None``.
+        data_file
+            Str object denoting the path to the input file (csv, txt, npz).
+        sep
+            Str object denoting the delimiter for the input file. Default: ``\t``.
+        header
+            Int object denoting row number(s) to use as the column names. Default: ``0``.
+        normalize
+            Bool object denoting whether apply standard normalization to covariates. Default: ``False``.
+        batch_size
+            Int object denoting the batch size in training. Default: ``32``.
+        n_iter
+            Int object denoting the training iterations. Default: ``30000``.
+        batches_per_eval
+            Int object denoting the number of iterations per evaluation. Default: ``500``.
+        batches_per_save
+            Int object denoting the number of iterations per save. Default: ``10000``.
+        startoff
+            Int object denoting the beginning iterations to jump without save and evaluation. Defalt: ``0``.
+        verbose
+            Bool object denoting whether showing the progress bar. Default: ``False``.
+        save_format
+            Str object denoting the format (csv, txt, npz) to save the results. Default: ``txt``.
+        """
+        
+        if self.params['save_res']:
+            f_params = open('{}/params.txt'.format(self.save_dir),'w')
+            f_params.write(str(self.params))
+            f_params.close()
+        if data is None and data_file is None:
+            self.data_sampler = Dataset_selector(self.params['dataset'])(batch_size=batch_size)
+        elif data is not None:
+            if len(data) != 2:
+                print('Data imcomplete error, please provide pair-wise (X, Y) in a list or tuple.')
+                sys.exit()
+            else:
+                self.data_sampler = Base_sampler(x=data[0],y=data[1],batch_size=batch_size,normalize=normalize)
+        else:
+            data = parse_file(data_file, sep, header, normalize)
+            self.data_sampler = Base_sampler(x=data[0],y=data[1],batch_size=batch_size,normalize=normalize)
+
+        #train reg_score
+        import pickle as pkl
+        import scanpy as sc
+        #reg_info = pkl.load(open('../reg_info.pkl', 'rb'))
+        reg_dic = pkl.load(open('../reg_dic.pkl', 'rb'))
+        TFs = [item.strip() for item in open('../motifscan/TFs.txt').readlines()]
+        TGs = [item.strip() for item in open('../data/pbmc10k/TGs.txt').readlines()]
+        all_genes = sc.read('../data/pbmc10k/adata_rna.h5').var['gene_ids'].index.to_list()
+        TF_gene_idx = [all_genes.index(item) for item in TFs]
+        TG_idx_all = list(reg_dic.keys())
+        import random
+        #train autoencoders
+        for batch_idx in range(n_iter+1):
+            batch_exp, batch_atac = self.data_sampler.next_batch()
+            if self.params['use_reg'] and batch_idx % self.params['n_freq'] == 0:
+                #print('error')
+                TG_idx = random.sample(TG_idx_all, 500)
+                exp_rec_loss, atac_rec_loss, align_loss,reg_loss, total_loss = self.train_step(batch_exp, batch_atac,
+                                        reg_dic, TF_gene_idx, TG_idx)
+                print('reg_loss %.4f'%reg_loss)
+            else:
+                exp_rec_loss, atac_rec_loss, align_loss, total_loss = self.train_ae_step(batch_exp, batch_atac)
+
+            if batch_idx % batches_per_eval == 0:
+                loss_contents = '''Iteration [%d] : exp_rec_loss [%.4f], atac_rec_loss [%.4f], align_loss [%.4f], total_loss [%.4f]''' \
+                %(batch_idx, exp_rec_loss, atac_rec_loss, align_loss, total_loss)
+                if verbose:
+                    print(loss_contents)
+                self.evaluate(self.data_sampler.load_all(), batch_idx)
+
+    def evaluate(self, data, batch_idx):
+        data_exp, data_atac = data
+        #data_tf_exp = data_exp[:,self.params['e_dim']:]
+        #data_exp = data_exp[:,:self.params['e_dim']]
+
+        data_z_exp = self.ee_net.predict(data_exp, batch_size=1)
+        #np.save('{}/data_embeds_at_{}.npy'.format(self.save_dir, batch_idx),data_z_exp)
+        
+        data_z_atac = np.vstack([self.ea_net.predict_on_batch(data_atac[i:(i+1),:]) 
+                    for i in np.arange(len(data_atac))])
+        #data_z_atac = self.ea_net.predict_on_batch(data_atac)
+        np.savez('{}/data_embeds_at_{}.npz'.format(self.save_dir, batch_idx),data_z_exp,data_z_atac)
+
+    def get_reg_score_numpy(self, reg_info, rna_mat, atac_mat, TFs, TGs, all_genes, query_genes):
+        assert len(TFs) == len(reg_info)
+        reg_score = []
+        for i in range(len(reg_info)):
+            reg_tf_score = []
+            for tg in query_genes:
+                tg_idx = TGs.index(tg)
+                idx = np.where(reg_info[i][:,0]==tg_idx)[0]
+                if len(idx)>0:
+                    sub_reg_info = reg_info[i][idx,:]
+                    peak_idx = sub_reg_info[:,1].astype('int8')
+                    s = np.mean(atac_mat[:,peak_idx] * sub_reg_info[:,2], axis=1)
+                    s *= rna_mat[:,all_genes.index(TFs[i])]
+                else:
+                    s = np.zeros(rna_mat.shape[0])
+                reg_tf_score.append(s)
+            reg_tf_score = np.stack(reg_tf_score).T
+            reg_score.append(reg_tf_score)
+        return np.stack(reg_score)
+
+    def get_reg_score(self, reg_info, rna_mat, atac_mat, TFs, TGs, all_genes, query_genes):
+        assert len(TFs) == len(reg_info)
+        reg_score = []
+        for i in range(len(reg_info)):
+            reg_tf_score = []
+            for tg in query_genes:
+                tg_idx = TGs.index(tg)
+                idx = np.where(reg_info[i][:,0]==tg_idx)[0]
+                if len(idx)>0:
+                    sub_reg_info = reg_info[i][idx,:]
+                    peak_idx = sub_reg_info[:,1].astype('int32')
+                    s = tf.reduce_mean(tf.gather(atac_mat, axis=1,indices=peak_idx) * sub_reg_info[:,2], axis=1)
+                    s *= rna_mat[:,all_genes.index(TFs[i])]
+                else:
+                    s = tf.zeros(tf.shape(rna_mat)[0])
+                reg_tf_score.append(s)
+            reg_tf_score = tf.stack(reg_tf_score)
+            reg_score.append(reg_tf_score)
+        return tf.stack(reg_score)
+
+    def get_reg_score_v2(self, reg_dic, rna_mat, atac_mat, TF_gene_idx, TG_idx):
+        reg_score = []
+        for j in range(len(TG_idx)):
+            reg_score_tf = []
+            for i in range(len(TF_gene_idx)):
+                if TF_gene_idx[i] in reg_dic[TG_idx[j]]:
+                    sub_reg_info = reg_dic[TG_idx[j]][TF_gene_idx[i]]
+                    peak_idx = sub_reg_info[:,0].astype('int32')
+                    #s = tf.reduce_mean(tf.gather(atac_mat, axis=1,indices=peak_idx) * sub_reg_info[:,1], axis=1)
+                    s = tf.reduce_mean(tf.gather(atac_mat, axis=1,indices=peak_idx), axis=1)
+                    s *= rna_mat[:,TF_gene_idx[i]]
+                else:
+                    s = tf.zeros(tf.shape(rna_mat)[0])
+                reg_score_tf.append(s)
+            reg_score.append(tf.stack(reg_score_tf))
+        return tf.stack(reg_score)
+                
