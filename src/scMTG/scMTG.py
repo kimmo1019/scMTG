@@ -1,7 +1,7 @@
 import tensorflow as tf
 from .model import Generator, Encoder, Discriminator, BaseFullyConnectedNet
 import numpy as np
-from .util import Gaussian_sampler, Multiome_loader_TI, Mixture_sampler,ARC_TS_Sampler, Base_sampler
+from .util import Gaussian_sampler, Multiome_loader_TI, Mixture_sampler,ARC_TS_Sampler, Base_sampler, Sequential_sampler
 import dateutil.tz
 import datetime
 import sys
@@ -17,7 +17,7 @@ tf.config.experimental.set_memory_growth(gpus[0], True)
 class scMTG(object):
     """scMTG model for clustering.
     """
-    def __init__(self, params):
+    def __init__(self, params, timestamp=None, random_seed=None):
         super(scMTG, self).__init__()
         self.params = params
         self.timestamp = timestamp
@@ -27,13 +27,14 @@ class scMTG(object):
                                         model_name='e_net', nb_units=params['e_units'])
         self.decoder = BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = params['e_dim'],
                                         model_name='d_net', nb_units=params['d_units'])
-        self.generators = [BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = params['z_dim'],
-                                        model_name='g_net_%d'%i, nb_units=params['g_units']) 
+        self.generators = [BaseFullyConnectedNet(input_dim=params['noise_dim']+params['z_dim'],output_dim = params['z_dim'],
+                                        model_name='g_net_%d'%i, nb_units=params['gen_units']) 
                                         for i in range(params['nb_time']-1)]                     
         self.discriminators = [BaseFullyConnectedNet(input_dim=params['z_dim'],output_dim = 1,
-                                        model_name='d_net_%d'%i, nb_units=params['d_units']) 
+                                        model_name='d_net_%d'%i, nb_units=params['dis_units']) 
                                         for i in range(params['nb_time']-1)] 
         self.optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
+        self.initialize_nets()
 
         if self.timestamp is None:
             now = datetime.datetime.now(dateutil.tz.tzlocal())
@@ -53,7 +54,6 @@ class scMTG(object):
 
         self.ckpt = tf.train.Checkpoint(encoder = self.encoder,
                                    decoder = self.decoder,
-                                   de_net = self.de_net,
                                    generators = self.generators,
                                    discriminators = self.discriminators,
                                    optimizer = self.optimizer)
@@ -69,14 +69,30 @@ class scMTG(object):
                 "params": self.params,
         }
 
+    def initialize_nets(self, print_summary = True):
+        """Initialize all the networks in CausalEGM."""
+
+        self.encoder(np.zeros((1, self.params['e_dim'])))
+        self.decoder(np.zeros((1, self.params['z_dim'])))
+        [self.generators[i](np.zeros((1, self.params['z_dim']+self.params['noise_dim']))) 
+            for i in range(self.params['nb_time']-1)]
+        [self.discriminators[i](np.zeros((1, self.params['z_dim']))) 
+            for i in range(self.params['nb_time']-1)]
+        if print_summary:
+            print(self.encoder.summary())
+            print(self.decoder.summary())
+            print([self.generators[i].summary() for i in range(self.params['nb_time']-1)])
+            print([self.discriminators[i].summary() for i in range(self.params['nb_time']-1)])
+
 
     @tf.function
     def train_ae_step(self, data_series):
         """train shared AE.
         """  
         with tf.GradientTape(persistent=True) as tape:
-            embed_series = [self.encoder(data) for data in data_series]
-            data_series_rec = tf.stack([self.decoder(data) for data in embed_series])
+            embed_series = tf.map_fn(lambda item:self.encoder(item) , data_series)
+            data_series_rec = tf.map_fn(lambda item:self.decoder(item) , embed_series)
+            #data_series_rec = tf.stack([self.decoder(data) for data in embed_series])
             rec_loss = tf.reduce_mean((data_series - data_series_rec)**2)
         # Calculate the gradients
         gradients = tape.gradient(rec_loss, self.encoder.trainable_variables+self.decoder.trainable_variables)
@@ -90,63 +106,102 @@ class scMTG(object):
         """train generators.
         """  
         with tf.GradientTape(persistent=True) as tape:
-            data_previous = [tf.concat([data, tf.random.normal(tf.shape(data),0.,1.),axis=1]) 
-                                for data in data_series[:-1]] #contain T-1 time points
-            data_gen = [self.generators[i](data) for i,data in enumerate(data_previous)]
-            data_true = [data for data in data_series[1:]]
+            embed_series = tf.map_fn(lambda item:self.encoder(item) ,data_series)
+            #embed_series = [self.encoder(data) for data in data_series]
+            #data_previous = [tf.concat([data, tf.random.normal(shape=(data_series.shape[1],self.params['noise_dim']),mean=0.,stddev=1.)],axis=1) 
+            #                    for data in embed_series[:-1]] #contain T-1 time points
+            data_previous = tf.map_fn(lambda data:tf.concat([data, tf.random.normal(shape=(data_series.shape[1],self.params['noise_dim']),mean=0.,stddev=1.)],axis=1), embed_series[:-1])
 
-            dz_gen = [self.discriminators[i](data) for i,data in enumerate(data_gen)]
+            data_gen = tf.TensorArray(tf.float32, size=data_previous.shape[0])
+            for i in range(data_previous.shape[0]):
+                data_gen = data_gen.write(i, self.generators[i](data_previous[i]))
+            data_gen=data_gen.stack()
+            #data_gen = [self.generators[i](data) for i,data in enumerate(data_previous)]
+            #data_true = [data for data in embed_series[1:]]
+            dz_gen = tf.TensorArray(tf.float32, size=data_gen.shape[0])
+            for i in range(data_gen.shape[0]):
+                dz_gen = dz_gen.write(i, self.discriminators[i](data_gen[i]))
+            dz_gen=dz_gen.stack()
+            #dz_gen = [self.discriminators[i](data) for i,data in enumerate(data_gen)]
             #dz_true = [self.discriminators[i](data) for i,data in enumerate(data_true)]
-
-            loss_g = tf.reduce_mean([-tf.reduce_mean(data) for data in dz_gen])
+            loss_g = -tf.reduce_mean(dz_gen)
+            #loss_g = tf.reduce_mean([-tf.reduce_mean(data) for data in dz_gen])
         # Calculate the gradients
-        gradients = tape.gradient(loss_g, [*(item.trainable_variables) for item in self.generators])
+        gradients = tape.gradient(loss_g, self.encoder.trainable_variables+sum([item.trainable_variables for item in self.generators], []))
         
         # Apply the gradients to the optimizer
-        self.optimizer.apply_gradients(zip(gradients, [*(item.trainable_variables) for item in self.generators]))
+        self.optimizer.apply_gradients(zip(gradients, self.encoder.trainable_variables+sum([item.trainable_variables for item in self.generators], [])))
         return loss_g
 
     @tf.function
     def train_disc_step(self, data_series):
         """train discriminators.
         """  
-
+        epsilon_z = tf.random.uniform(shape=(self.params['nb_time']-1,1,1),minval=0., maxval=1.)
         with tf.GradientTape(persistent=True) as tape:
-            data_previous = [tf.concat([data, tf.random.normal(tf.shape(data),0.,1.),axis=1]) 
-                                for data in data_series[:-1]] #contain T-1 time points
-            data_gen = [self.generators[i](data) for i,data in enumerate(data_previous)]
-            data_true = [data for data in data_series[1:]]
+            embed_series = tf.map_fn(lambda item:self.encoder(item) ,data_series)
+            b = self.encoder(data_series[1])
+            a = tf.gradients(b,data_series[1])
+            print('a',a)#None
+            data_previous = tf.map_fn(lambda data:tf.concat([data, tf.random.normal(shape=(data_series.shape[1],self.params['noise_dim']),mean=0.,stddev=1.)],axis=1), embed_series[:-1])
 
-            dz_gen = [self.discriminators[i](data) for i,data in enumerate(data_gen)]
-            dz_true = [self.discriminators[i](data) for i,data in enumerate(data_true)]
-            loss_d = tf.reduce_mean([tf.reduce_mean(data) for data in dz_gen]) - \
-                        tf.reduce_mean([tf.reduce_mean(data) for data in dz_true]) 
+            data_gen = tf.TensorArray(tf.float32, size=self.params['nb_time']-1)
 
+            for i in range(self.params['nb_time']-1):
+                data_gen = data_gen.write(i, self.generators[i](data_previous[i]))
+            data_gen=data_gen.stack()
+
+            data_true = embed_series[1:]
+
+            dz_gen = tf.TensorArray(tf.float32, size=self.params['nb_time']-1)
+            for i in range(self.params['nb_time']-1):
+                dz_gen = dz_gen.write(i, self.discriminators[i](data_gen[i]))
+            dz_gen=dz_gen.stack()
+
+            dz_true = tf.TensorArray(tf.float32, size=self.params['nb_time']-1)
+            for i in range(self.params['nb_time']-1):
+                dz_true = dz_true.write(i, self.discriminators[i](data_true[i]))
+            dz_true = dz_true.stack()
+            loss_d = tf.reduce_mean(dz_gen)-tf.reduce_mean(dz_true)
+            #dz_gen = [self.discriminators[i](data) for i,data in enumerate(data_gen)]
+            #dz_true = [self.discriminators[i](data) for i,data in enumerate(data_true)]
+            # loss_d = tf.reduce_mean([tf.reduce_mean(data) for data in dz_gen]) - \
+            #             tf.reduce_mean([tf.reduce_mean(data) for data in dz_true]) 
             #gradient penalty for z
-            epsilon_z = tf.random.uniform([],minval=0., maxval=1.)
-            data_hat = [item[0]*epsilon_z+item[1]*(1-epsilon_z) for item in zip(dz_gen,dz_true)]
-            dz_hat = [self.discriminators[i](data) for i,data in enumerate(data_hat)]
-            grad_z = [tf.gradients(item[1], item[0])[0] for item in zip(data_hat,dz_hat)] #(bs,z_dim)
-            grad_norm_z = [tf.sqrt(tf.reduce_sum(tf.square(item), axis=1)) for item in grad_z]
-            gpz_loss = tf.reduce_mean([tf.reduce_mean(tf.square(item - 1.0)) for item in grad_norm_z])
+            # data_hat = epsilon_z*data_gen+(1-epsilon_z)*data_true
+
+            # dz_hat = tf.TensorArray(tf.float32, size=self.params['nb_time']-1)
+            # for i in range(self.params['nb_time']-1):
+            #     dz_hat = dz_hat.write(i, self.discriminators[i](data_hat[i]))
+            # dz_hat=dz_hat.stack()
+
+            # grad_z = tf.TensorArray(tf.float32, size=self.params['nb_time']-1)
+            # for i in tf.range(self.params['nb_time']-1):
+            #     grad_z = grad_z.write(i, tf.gradients(dz_hat[i],data_hat[i])[0])
+            # grad_z=grad_z.stack() #(2, bs, z_dim)
+
+            # loss = tf.constant(0)
+            # for i in tf.range(self.params['nb_time']-1):
+            #     grad_norm = tf.sqrt(tf.reduce_sum(tf.square(grad_z[i]), axis=1))
+            #     loss += tf.reduce_mean(tf.square(grad_norm - 1.0))
+            # gpz_loss = loss / grad_z.shape[0]
+            gpz_loss = 0
 
             loss_d_total = loss_d + self.params['alpha']*gpz_loss
         # Calculate the gradients
-        gradients = tape.gradient(loss_d_total, [*(item.trainable_variables) for item in self.discriminators])
+        gradients = tape.gradient(loss_d_total, self.encoder.trainable_variables+sum([item.trainable_variables for item in self.discriminators], []))
         
         # Apply the gradients to the optimizer
-        self.optimizer.apply_gradients(zip(gradients, [*(item.trainable_variables) for item in self.discriminators]))
+        self.optimizer.apply_gradients(zip(gradients, self.encoder.trainable_variables+sum([item.trainable_variables for item in self.discriminators], [])))
         return loss_d, gpz_loss, loss_d_total
 
-    def train(self):
+    def train(self, data=None, normalize=False,
+            batch_size=32, n_iter=30000, batches_per_eval=500,verbose=1):
         if self.params['save_res']:
             f_params = open('{}/params.txt'.format(self.save_dir),'w')
             f_params.write(str(self.params))
             f_params.close()
-        if data is None:
-            self.data_sampler = Dataset_selector(self.params['dataset'])(batch_size=batch_size)
-        else:
-            self.data_sampler = Base_sampler(x=data[0],y=data[1],batch_size=batch_size,normalize=normalize)
+        self.data_sampler = Sequential_sampler(data=data,batch_size=batch_size)
 
         #train autoencoders
         for batch_idx in range(n_iter+1):
@@ -165,10 +220,11 @@ class scMTG(object):
                 self.evaluate(self.data_sampler.load_all(), batch_idx)
 
     def evaluate(self, data_series, batch_idx):
-        data_previous = [np.concatenate([data, np.random.normal(data.shape,0.,1.),axis=1]) 
-                            for data in data_series[:-1]] #contain T-1 time points
-        data_gen = np.stack([self.generators[i](data) for i,data in enumerate(data_previous)])
-        np.savez('{}/data_gen_at_{}.npz'.format(self.save_dir, batch_idx),data_gen)
+        embed_series = [self.encoder.predict(item) for item in data_series]
+        data_previous = [np.concatenate([data, np.random.normal(0.,1.,size=(data.shape[0],self.params['noise_dim']))],axis=1) 
+                            for data in embed_series[:-1]] #contain T-1 time points
+        data_gen = [self.generators[i].predict(data) for i,data in enumerate(data_previous)]
+        np.savez('{}/data_gen_at_{}.npz'.format(self.save_dir, batch_idx),t0=data_gen[0],t1=data_gen[1])
 
 
 class scDEC(object):
