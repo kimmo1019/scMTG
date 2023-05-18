@@ -200,7 +200,7 @@ class ARC_TS_Sampler(object):
 
 
 class Gaussian_sampler(object):
-    def __init__(self, N, mean, sd=1):
+    def __init__(self, N=20000, mean=0, sd=1):
         self.total_size = N
         self.mean = mean
         self.sd = sd
