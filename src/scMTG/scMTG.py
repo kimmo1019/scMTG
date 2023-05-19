@@ -34,9 +34,9 @@ class scMTG(object):
                                         model_name='d_net_%d'%i, nb_units=params['dis_units']) 
                                         for i in range(params['nb_time']-1)] 
         self.ae_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
+        self.e_optimizer = tf.keras.optimizers.Adam(0.00002, beta_1=0.5, beta_2=0.9)
         self.g_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
         self.d_optimizer = tf.keras.optimizers.Adam(params['lr'], beta_1=0.5, beta_2=0.9)
-        self.z_sampler = Gaussian_sampler(mean=np.zeros(params['noise_dim']), sd=1.0)
 
         self.initialize_nets()
 
@@ -61,6 +61,7 @@ class scMTG(object):
                                    generators = self.generators,
                                    discriminators = self.discriminators,
                                    ae_optimizer = self.ae_optimizer,
+                                   e_optimizer = self.e_optimizer,
                                    g_optimizer = self.g_optimizer,
                                    d_optimizer = self.d_optimizer)
         self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, self.checkpoint_path, max_to_keep=3)                 
@@ -90,7 +91,6 @@ class scMTG(object):
             print([self.generators[i].summary() for i in range(self.params['nb_time']-1)])
             print([self.discriminators[i].summary() for i in range(self.params['nb_time']-1)])
 
-
     @tf.function
     def train_ae_step(self, data_series):
         """train shared AE.
@@ -99,7 +99,6 @@ class scMTG(object):
             embed_series = tf.map_fn(lambda item:self.encoder(item) , data_series)
             data_series_rec = tf.map_fn(lambda item:self.decoder(item) , embed_series)
             loss_rec = tf.reduce_mean((data_series - data_series_rec)**2)
-
         # Calculate the gradients
         gradients = tape.gradient(loss_rec, self.encoder.trainable_variables+self.decoder.trainable_variables)
         # Apply the gradients to the optimizer
@@ -130,11 +129,12 @@ class scMTG(object):
             loss_td = tf.reduce_mean((data_gen-embed_series[:-1])**2)
             loss_g_total = loss_g + self.params['beta']*loss_td
         # Calculate the gradients
-        gradients = gen_tape.gradient(loss_g, sum([item.trainable_variables for item in self.generators], []))
-        #self.encoder.trainable_variables
-
-        # Apply the gradients to the optimizer
-        self.g_optimizer.apply_gradients(zip(gradients, sum([item.trainable_variables for item in self.generators], [])))
+        g_gradients = gen_tape.gradient(loss_g_total, sum([item.trainable_variables for item in self.generators], []))
+        self.g_optimizer.apply_gradients(zip(g_gradients, sum([item.trainable_variables for item in self.generators], [])))
+        
+        e_gradients = gen_tape.gradient(loss_g_total, self.encoder.trainable_variables)
+        self.e_optimizer.apply_gradients(zip(e_gradients, self.encoder.trainable_variables))
+        
         return loss_g,loss_td
 
     @tf.function
@@ -180,10 +180,11 @@ class scMTG(object):
             loss_d_total = loss_d + self.params['alpha']*loss_gp
 
         # Calculate the gradients
-        gradients = disc_tape.gradient(loss_d_total, sum([item.trainable_variables for item in self.discriminators], []))
-        #self.encoder.trainable_variables
-        # Apply the gradients to the optimizer
-        self.d_optimizer.apply_gradients(zip(gradients, sum([item.trainable_variables for item in self.discriminators], [])))
+        d_gradients = disc_tape.gradient(loss_d_total, sum([item.trainable_variables for item in self.discriminators], []))
+        self.d_optimizer.apply_gradients(zip(d_gradients, sum([item.trainable_variables for item in self.discriminators], [])))
+
+        #e_gradients = disc_tape.gradient(loss_d_total, self.encoder.trainable_variables)
+        #self.e_optimizer.apply_gradients(zip(e_gradients, self.encoder.trainable_variables))
         return loss_d, loss_gp, loss_d_total
 
     def train(self, data, batch_size=32, n_iter=30000, batches_per_eval=500,verbose=1):
@@ -197,8 +198,8 @@ class scMTG(object):
         for batch_idx in range(n_iter+1):
             batch_data_series = self.data_sampler.next_batch()
             loss_rec = self.train_ae_step(batch_data_series)
-            if batch_idx % 1 == 0:
-                for _ in range(5):
+            if batch_idx % 5 == 0:
+                for _ in range(3):
                     batch_data_series = self.data_sampler.next_batch()
                     loss_d, loss_gp, loss_d_total = self.train_disc_step(batch_data_series)
                 batch_data_series = self.data_sampler.next_batch()
