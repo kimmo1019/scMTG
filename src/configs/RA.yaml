@@ -1,0 +1,18 @@
+dataset: RA
+output_dir: '.'
+alpha: 10
+beta: 0.5
+sd: 0.5
+e_dim: 2794
+z_dim: 30
+noise_dim: 8 
+lr: 0.0002
+g_d_freq: 5
+ae_gan_freq: 5
+nb_time: 3
+e_units: [1024, 512, 256, 64]
+d_units: [64, 256, 512, 1024]
+gen_units: [32, 64, 64, 64, 32]
+dis_units: [32, 64, 64, 32]
+save_model: False
+save_res: True

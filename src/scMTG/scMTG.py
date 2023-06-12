@@ -128,14 +128,14 @@ class scMTG(object):
             loss_g = -tf.reduce_mean(dz_gen)
             loss_td = tf.reduce_mean((data_gen-embed_series[:-1])**2)
             loss_g_total = loss_g + self.params['beta']*loss_td
+
         # Calculate the gradients
         g_gradients = gen_tape.gradient(loss_g_total, sum([item.trainable_variables for item in self.generators], []))
         self.g_optimizer.apply_gradients(zip(g_gradients, sum([item.trainable_variables for item in self.generators], [])))
         
         e_gradients = gen_tape.gradient(loss_g_total, self.encoder.trainable_variables)
         self.e_optimizer.apply_gradients(zip(e_gradients, self.encoder.trainable_variables))
-        
-        return loss_g,loss_td
+        return loss_g, loss_td
 
     @tf.function
     def train_disc_step(self, data_series):
@@ -198,8 +198,8 @@ class scMTG(object):
         for batch_idx in range(n_iter+1):
             batch_data_series = self.data_sampler.next_batch()
             loss_rec = self.train_ae_step(batch_data_series)
-            if batch_idx % 5 == 0:
-                for _ in range(3):
+            if batch_idx % self.params['ae_gan_freq'] == 0:
+                for _ in range(self.params['g_d_freq']):
                     batch_data_series = self.data_sampler.next_batch()
                     loss_d, loss_gp, loss_d_total = self.train_disc_step(batch_data_series)
                 batch_data_series = self.data_sampler.next_batch()
@@ -215,10 +215,12 @@ class scMTG(object):
         embed_series = [self.encoder.predict(item) for item in data_series]
         data_previous = [np.concatenate([data, np.random.normal(0.,self.params['sd'],size=(data.shape[0],self.params['noise_dim']))],axis=1) 
                             for data in embed_series[:-1]] #contain T-1 time points
-        data_gen = [self.generators[i].predict(data) for i,data in enumerate(data_previous)]
+        data_gen_z = [self.generators[i].predict(data) for i,data in enumerate(data_previous)]
+        data_gen_org = [self.decoder.predict(item) for item in data_gen_z]
+        
         np.savez('{}/data_embed_at_{}.npz'.format(self.save_dir, batch_idx),t0=embed_series[0],t1=embed_series[1],t2=embed_series[2])
-        np.savez('{}/data_gen_at_{}.npz'.format(self.save_dir, batch_idx),t1=data_gen[0],t2=data_gen[1])
-
+        np.savez('{}/data_gen_at_{}.npz'.format(self.save_dir, batch_idx),t1=data_gen_z[0],t2=data_gen_z[1])
+        np.savez('{}/data_gen_org_at_{}.npz'.format(self.save_dir, batch_idx),t1=data_gen_org[0],t2=data_gen_org[1])
 
 class scDEC(object):
     """scDEC model for clustering.

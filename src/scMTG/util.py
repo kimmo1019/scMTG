@@ -335,7 +335,7 @@ def plot_embedding(X, labels, classes=None, method='tSNE', cmap='tab20', figsize
     for i, c in enumerate(classes):
         x_center, y_center = np.mean(X[:N][labels==c, 0]), np.mean(X[:N][labels==c, 1])
         plt.scatter(X[:N][labels==c, 0], X[:N][labels==c, 1], s=markersize, color=colors[i], label=c)
-        plt.text(x_center, y_center, str(i), dict(size=20))
+        #plt.text(x_center, y_center, str(i), dict(size=20))
         
     if marker is not None:
         plt.scatter(X[N:, 0], X[N:, 1], s=10*markersize, color='black', marker='*')
